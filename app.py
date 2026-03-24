@@ -1,92 +1,95 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, PatternFill, Border, Side, Font
+from datetime import datetime, time, timedelta
 from io import BytesIO
 
-# --- GANTT ENGINE ---
-class GanttEngine:
+class ProductionGanttSystem:
     def __init__(self):
         self.START_HOUR = 3  # Day starts at 03:00
-        self.BASE_COL = 27   # Based on Wk14.csv, 03:00 is roughly Col AA (27)
-        self.COL_PER_HOUR = 4 # 15 min increments
+        self.BASE_COL = 27   # Column AA
+        self.COL_PER_DAY = 96
+        self.DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
-    def get_column_index(self, time_obj):
-        if time_obj is None: return None
-        h, m = time_obj.hour, time_obj.minute
-        # Adjust for 3 AM start
-        rel_h = h + (24 - self.START_HOUR) if h < self.START_HOUR else h - self.START_HOUR
-        return self.BASE_COL + (rel_h * self.COL_PER_HOUR) + (m // 15)
-
-    def process(self, fill_file, template_file, week_name):
-        # Read Input
-        df = pd.read_excel(fill_file, sheet_name='Fill')
-        wb = openpyxl.load_workbook(template_file)
+    def build_and_fill(self, fill_df, start_date):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"Wk_{start_date.isocalendar()[1]}"
         
-        if week_name not in wb.sheetnames:
-            return None, f"Sheet {week_name} not found in template!"
+        # 1. SETUP THE TEMPLATE (Styling & Headers)
+        thin = Side(border_style="thin")
+        border = Border(top=thin, left=thin, right=thin, bottom=thin)
         
-        ws = wb[week_name]
-        
-        # Simple Line-to-Row Mapping (Customize this for your lines)
-        line_map = {"Pump": 11, "Ref1": 15, "Ref2": 19} 
-
-        for _, row in df.iterrows():
-            # Adjust these indices based on your 'Fill' sheet columns
-            line_name = str(row.iloc[2]) # Col C
-            start_t = row.iloc[4]        # Col E
-            finish_t = row.iloc[5]       # Col F
-            prod_code = str(row.iloc[2])
-
-            if pd.isna(start_t) or pd.isna(finish_t): continue
-
-            start_col = self.get_column_index(start_t)
-            end_col = self.get_column_index(finish_t)
+        # Draw Time Scale for each day
+        for d_idx, day_name in enumerate(self.DAYS):
+            col_start = self.BASE_COL + (d_idx * self.COL_PER_DAY)
+            day_dt = start_date + timedelta(days=d_idx)
             
-            # Row mapping logic
-            target_row = 11 # Default row
-            for key, val in line_map.items():
-                if key in line_name: target_row = val
+            # Day Header
+            ws.merge_cells(start_row=8, start_column=col_start, end_row=8, end_column=col_start+95)
+            ws.cell(row=8, column=col_start, value=f"{day_name} {day_dt.date()}").alignment = Alignment(horizontal="center")
+            
+            # Hour Labels (3, 7, 11, 15, 19, 23 cycle)
+            for h in range(24):
+                hr_val = (self.START_HOUR + h) % 24
+                c = col_start + (h * 4)
+                ws.merge_cells(start_row=9, start_column=c, end_row=9, end_column=c+3)
+                cell = ws.cell(row=9, column=c, value=f"{hr_val}:00")
+                cell.alignment = Alignment(horizontal="center")
+                cell.border = border
 
-            # Color Logic
-            color = "FFCC00" if "DVB" in prod_code else "99CCFF"
-            fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
-
-            for c in range(start_col, end_col):
-                ws.cell(row=target_row, column=c).fill = fill
+        # 2. POPULATE PRODUCTION DATA
+        line_rows = {"Pump": 11, "Ref-1": 14, "Ref-2": 17, "Ref-3": 20} # Expand as needed
         
-        # Save to memory buffer
-        out_buf = BytesIO()
-        wb.save(out_buf)
-        return out_buf, None
+        for idx, row in fill_df.iterrows():
+            if idx < 3: continue # Skip headers
+            
+            date_val = row[0]
+            prod_name = str(row[2])
+            start_t = row[4]
+            end_t = row[5]
+
+            if not isinstance(start_t, time) or not isinstance(end_t, time): continue
+
+            # Calculate Day Offset (0=Mon, 1=Tue, etc.)
+            try:
+                day_offset = (date_val.date() - start_date.date()).days
+            except: day_offset = 0 
+            
+            # Color Mapping
+            color = "D3D3D3" # Default Setup (Gray)
+            if "DVB" in prod_name: color = "FFCC00" # Yellow
+            elif "LSL" in prod_name: color = "99CCFF" # Blue
+            
+            # Calculate Columns
+            sc = self.get_col(start_t, day_offset)
+            ec = self.get_col(end_t, day_offset)
+            
+            # Paint the cells
+            target_row = line_rows.get("Pump", 11) # Logic to detect line from prod_name goes here
+            for c in range(sc, ec):
+                ws.cell(row=target_row, column=c).fill = PatternFill("solid", fgColor=color)
+                if c == sc: ws.cell(row=target_row, column=c).value = prod_name
+
+        output = BytesIO()
+        wb.save(output)
+        return output.getvalue()
+
+    def get_col(self, t, day_off):
+        rel_h = t.hour - self.START_HOUR
+        if t.hour < self.START_HOUR: rel_h += 24
+        return self.BASE_COL + (day_off * 96) + (rel_h * 4) + (t.minute // 15)
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="Production Gantt Maker", layout="wide")
-st.title("📊 Production Schedule Automator")
-st.markdown("Upload your **Fill** file and **Weekly Template** to generate the schedule.")
+st.title("🚀 Auto-Gantt Engine")
+uploaded_file = st.file_uploader("Upload Fill_XX.xlsm", type=["xlsm"])
+start_date = st.date_with_week = st.date_input("Select Monday Start Date", datetime(2026, 3, 30))
 
-with st.sidebar:
-    st.header("Settings")
-    week_selection = st.selectbox("Select Week Sheet", ["Wk14", "Wk15", "Wk16", "Wk17"])
-
-col1, col2 = st.columns(2)
-with col1:
-    fill_input = st.file_uploader("Upload 'Fill' File (xlsm)", type=['xlsm', 'xlsx'])
-with col2:
-    temp_input = st.file_uploader("Upload 'Weekly' Template (xlsx)", type=['xlsx'])
-
-if fill_input and temp_input:
-    if st.button("Generate Gantt Chart"):
-        engine = GanttEngine()
-        result, error = engine.process(fill_input, temp_input, week_selection)
+if uploaded_file:
+    if st.button("Build From Scratch"):
+        df = pd.read_excel(uploaded_file, sheet_name='Fill', header=None)
+        engine = ProductionGanttSystem()
+        final_excel = engine.build_and_fill(df, start_date)
         
-        if error:
-            st.error(error)
-        else:
-            st.success("Gantt Chart Generated!")
-            st.download_button(
-                label="📥 Download Result",
-                data=result.getvalue(),
-                file_name=f"Generated_Weekly_{week_selection}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        st.download_button("📥 Download Generated Schedule", final_excel, "Weekly_Output.xlsx")
